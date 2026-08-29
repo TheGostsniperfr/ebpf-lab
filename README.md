@@ -1,216 +1,382 @@
 # ebpf-lab
 
-A minimal, real, runnable eBPF program: an XDP hook that counts packets per
-source IPv4 address in an in-kernel hash map, loaded and read from a small Go
-program. Built to understand eBPF by shipping something, not by reading slides.
+A minimal, real, runnable eBPF program, explained from zero. If you've never
+touched kernel-space code before, this doc is written for you: every piece of
+jargon is defined the first time it shows up, in order, before it gets reused.
+
+The demo itself: a small piece of code that runs *inside the Linux kernel*
+and counts network packets by source IP address, plus a normal Go program
+that reads those counts. That's it — small on purpose, so the mechanism is
+visible instead of buried under features.
+
+## 1. The problem, before the acronym
+
+Every program you've ever written runs in **user space**: your own memory,
+your own crash blast radius, and every time you need something the machine
+itself controls — send a network packet, open a file, talk to a device —
+you ask the kernel to do it for you through a **syscall** (system call). The
+kernel is the one piece of software with full access to the hardware; your
+program never touches the network card directly, it asks the kernel to.
+
+That boundary is exactly why the kernel is normally *closed* to you. You
+can't just drop a function into it and see what happens — if that function
+has a bug, there's no safety net. A crash in the kernel isn't "your program
+exits," it's the whole machine going down.
+
+Historically, if you genuinely needed code running inside the kernel — to
+inspect every packet at line rate, or watch every syscall a process makes,
+without the overhead of asking the kernel a question every single time —
+you had two bad options:
+
+- **Write a kernel module** (a `.ko` file, loaded with `insmod`): real
+  kernel code, full power, full risk. A bug is a kernel panic (the machine
+  freezes/reboots) or, if it's a bug an attacker can trigger, a way to take
+  over the box completely. It also has to be built against a specific
+  kernel version, so it's fragile across upgrades.
+- **Watch from the outside** with tools like `ptrace` (the mechanism behind
+  `strace`): safe, because your watcher stays in user space, but it works by
+  pausing the target process on every single event you're watching for, then
+  resuming it once your watcher has looked. That stop-the-world-per-event
+  cost is fine for debugging one process by hand; it's not something you can
+  run permanently on every server watching every syscall.
+
+**eBPF** (extended Berkeley Packet Filter — the name is a historical
+leftover from when it only filtered packets; today it runs almost anywhere
+in the kernel, not just networking) is a third option: your code actually
+runs inside the kernel, at near-native speed, but the kernel refuses to load
+it in the first place unless it can prove your code is safe. No panics, no
+`insmod`, and — because the check happens automatically — no per-event
+pause-and-resume cost either.
+
+## 2. The vocabulary you need to read the rest of this doc
+
+Five terms, defined once, used everywhere after this:
+
+- **Hook (or attach point)** — a specific spot in the kernel where you're
+  allowed to plug in a small program, and a specific *type of event* that
+  triggers it. "Every time a packet arrives on this network card" is a hook.
+  "Every time this particular kernel function is called" is a different
+  hook. You don't get to run code just anywhere in the kernel — only at
+  points the kernel exposes on purpose.
+- **Bytecode** — the code you write for the kernel side (C, in this repo)
+  isn't compiled directly to your CPU's real instructions. It's first
+  compiled to eBPF's own simple instruction format
+  (bytecode) — a deliberately small, easy-to-analyze instruction set. This
+  is what actually gets handed to the kernel when you "load" a program.
+- **The verifier** — the piece of the kernel that reads your bytecode
+  *before* running a single instruction of it, walks through every possible
+  path your code could take, and refuses to load it if it finds anything
+  that could go wrong. Concretely, that means rejecting a program that has:
+  a loop that might never end; a memory read past the end of a buffer; a
+  variable read before it's ever been given a value; or a stack frame using
+  more than a fixed budget of space. This is the actual safety mechanism —
+  not "trust the programmer,"
+  but "prove it, or it doesn't run." It's also why eBPF code can't do
+  everything normal C can: no recursion, no unbounded loops, a hard cap on
+  how much stack you get (512 bytes) — the verifier has to be *able* to
+  prove your program terminates and stays in bounds, so anything it can't
+  reason about gets rejected.
+- **JIT (just-in-time compilation)** — once the verifier accepts your
+  bytecode, the kernel translates it into your actual CPU's native machine
+  instructions before running it. This is why eBPF isn't slow despite being
+  "checked first": the checking happens once, at load time, and after that
+  it runs as real compiled code, not as an interpreted script.
+- **BPF map** — your eBPF code runs inside the kernel; your normal program
+  (this repo's Go binary) runs in user space. They can't share memory
+  directly. A map is a small key→value store, similar in spirit to a
+  `dict`/`HashMap`, that both sides are allowed to read and write. It's the
+  *only* channel between the two worlds: the kernel side writes into it, the
+  user-space side reads from it (or the reverse). In this repo, the kernel
+  side counts packets into a map; the Go program's whole job is reading that
+  map back out.
+
+That's the full mechanism: **hook → bytecode → verifier → JIT → running
+code that talks to user space through a map.** Everything below is that
+mechanism applied to one concrete example.
+
+One more term you'll see mentioned but that this demo doesn't actually use:
+**CO-RE** ("Compile Once – Run Everywhere"). It's the feature that lets one
+compiled eBPF program run unmodified across different kernel versions,
+by embedding extra type information (called **BTF**) that the kernel uses to
+patch up memory-layout details at load time instead of at compile time.
+Tools like Falco or Cilium rely on it heavily so they can ship one binary
+instead of a build-per-kernel-version. This demo skips it because it only
+touches two very old, very stable data structures (an Ethernet header and an
+IP header) whose layout hasn't changed in decades — so there's nothing for
+CO-RE to protect against here. Mentioned so the term isn't a mystery if you
+go read Cilium's or Falco's code next; not needed to understand this repo.
+
+## 3. What this demo's hook actually is
+
+The hook this demo uses is called **XDP** (eXpress Data Path): "run my code
+as early as possible when a packet arrives on this network card" — as close
+to the hardware as the kernel lets you get, before routing decisions,
+firewall rules, or **connection tracking** (the kernel's internal
+bookkeeping of which packets belong to which ongoing connection, so it
+doesn't have to re-evaluate every rule for every packet of the same
+conversation) have touched the packet. That
+"before anything else" positioning is XDP's whole reason to exist: it's the
+cheapest possible place to make a decision about a packet (count it, drop
+it, redirect it) because none of the normal networking machinery has run
+yet.
 
 ```
-kernel                                   userspace
-┌─────────────────────────────┐          ┌──────────────────────┐
-│ NIC driver rx path           │          │ cmd/xdpcount/main.go │
-│  └─ XDP hook (bpf/xdpcount.c)│◄── attach─┤  link.AttachXDP()    │
-│      └─ pkt_count (BPF map) │◄── read ──┤  Map.Iterate()       │
-└─────────────────────────────┘          └──────────────────────┘
+kernel                                       user space
+┌───────────────────────────────┐            ┌──────────────────────┐
+│ network card receives a packet│            │ cmd/xdpcount/main.go │
+│   └─ XDP hook (bpf/xdpcount.c)│◄── attach ──┤   link.AttachXDP()   │
+│        counts it into a map   │            │                       │
+│   pkt_count (BPF map)         │◄── read ───┤   Map.Iterate()      │
+└───────────────────────────────┘            └──────────────────────┘
 ```
+
+The Go program's job is small and split cleanly from the kernel side: load
+the compiled bytecode, attach it to a network interface, then every couple
+of seconds read the map and print what's in it. All the actual packet
+inspection happens on the kernel side, once per packet, without the Go
+program being involved at all.
 
 ## Quickstart
 
-Requires Linux (obviously) and either the Nix flake devShell or a manual
-toolchain (clang with BPF target, libbpf headers, kernel uapi headers).
+Requires Linux and either the Nix flake devShell in this repo, or a manual
+toolchain (clang that can target BPF, libbpf's headers, kernel headers).
 
 ```console
 $ nix develop
 $ go generate ./cmd/xdpcount   # recompiles bpf/xdpcount.c -> .o + Go bindings (only needed if you edit the .c)
 $ go build ./...
-$ sudo ./xdpcount -iface eth0  # needs CAP_BPF + CAP_NET_ADMIN, root is simplest
+$ sudo ./xdpcount -iface eth0  # see "why sudo" below
 ```
 
-The generated `xdpcount_bpfel.go` / `xdpcount_bpfel.o` (and `_bpfeb` twins) are
-committed to the repo. This is deliberate, not an oversight: it means anyone
-cloning this repo can `go build` it with a stock Go toolchain and *no* BPF
-compiler at all — you only need clang/libbpf/kernel-headers (i.e. `nix
-develop`) when you're changing the eBPF C source itself. That split between
-"build the userspace loader" and "recompile the kernel-side program" is the
-same one every real eBPF-based Go project (Cilium, Tetragon, Hubble) makes.
+Why `sudo`: loading an eBPF program needs the `CAP_BPF` and `CAP_NET_ADMIN`
+**capabilities**. Linux capabilities are a way to grant a process one
+specific slice of what root can do (e.g. "load BPF programs," "administer
+network interfaces") instead of all of it — but in practice, most setups
+(including this demo) just run as root rather than granting those two
+capabilities individually.
 
-## What eBPF actually is
+The generated `xdpcount_bpfel.go` / `xdpcount_bpfel.o` files (plus a second,
+rarely-needed pair for a small family of CPU architectures — more on that in
+section 4) are committed to the repo on purpose.
+That means anyone cloning this repo can `go build` it with a stock Go
+toolchain and no BPF compiler at all — you only need the Nix devShell
+(clang/libbpf/kernel-headers) when you're editing the eBPF C source itself
+and need to regenerate those files. That split — "build the normal Go
+program" vs. "recompile the kernel-side program" — is the same one every
+real eBPF-based Go project (Cilium, Tetragon, Hubble) makes.
 
-eBPF lets you load small programs into the kernel that run at defined hook
-points (a syscall entry, a tracepoint, a network device's rx path, a cgroup
-boundary, ...) without writing a kernel module. Loading one still typically
-needs `CAP_BPF`/`CAP_NET_ADMIN` (often root, in practice — Cilium's own
-agent runs privileged) — the verifier doesn't remove that requirement, it
-changes what a bug in the loaded code can do to the box. Three things make
-that possible:
+## 4. Reading the actual code
 
-- **The verifier.** Before a program is attached, the kernel walks every
-  possible execution path and rejects the load if it finds unbounded loops,
-  out-of-bounds memory access, uninitialized reads, or a stack frame over
-  512 bytes. Until Linux 5.2 this verification was also capped at 4096
-  instructions total; 5.2 raised the *complexity* budget explored by the
-  verifier to 1,000,000, but that 4096-instruction ceiling is still enforced
-  for programs loaded by processes without `CAP_BPF`/`CAP_SYS_ADMIN` — i.e.
-  the "unprivileged" path is deliberately kept far more restricted than what
-  root can load. Bounded loops (a loop the verifier can prove terminates)
-  have only been allowed since 5.3; before that, every loop had to be
-  manually unrolled at compile time.
-- **JIT compilation.** The verified bytecode is JITed to native machine code
-  before it runs — this is not an interpreted VM in the hot path (an
-  interpreter still exists as a fallback for when JIT is disabled or
-  unavailable on the target architecture).
-- **Maps**, not shared memory: the *only* way in or out of a running BPF
-  program is through typed key/value stores (`BPF_MAP_TYPE_HASH`,
-  `_ARRAY`, `_LRU_HASH`, `_PERF_EVENT_ARRAY`, `_RINGBUF`, ...) that both the
-  kernel program and a userspace process can read/write concurrently. This
-  demo's `pkt_count` map is exactly that: the kernel side writes counts, the
-  Go side polls them with `Map.Iterate()`.
+`bpf/xdpcount.c` is the part that runs inside the kernel. Three pieces:
 
-**CO-RE** (Compile Once – Run Everywhere) is the other piece that made eBPF
-practical outside of "recompile against this exact kernel's headers." A
-program compiled with BTF (BPF Type Format) debug info embedded — which is
-what `-g` plus a BTF-enabled kernel (`CONFIG_DEBUG_INFO_BTF`) gives you —
-carries enough type information that libbpf can patch struct-offset-dependent
-instructions at *load* time against whatever kernel it's actually running on,
-instead of at compile time. This demo doesn't use CO-RE (no `vmlinux.h`, no
-`BPF_CORE_READ`) because it only touches stable UAPI structs
-(`struct ethhdr`, `struct iphdr`) that don't need it — but it's the reason
-tools like Falco or Cilium ship one binary that works across kernel versions
-instead of a matrix of kernel-module builds.
+**The map.** `pkt_count` is declared as a `BPF_MAP_TYPE_LRU_HASH`: a
+key→value store (key = a source IP, value = a packet count) with a fixed
+maximum size, where "LRU" (Least Recently Used) means that once it's full,
+inserting a new key automatically evicts whichever existing key hasn't been
+touched in the longest time — instead of just refusing the insert. That's a
+deliberate trade-off, not a default you can ignore: a plain hash map (no
+LRU) would start silently rejecting new source IPs once full, which means
+you'd stop seeing new attackers/hosts the moment the map fills up. The LRU
+version keeps accepting new IPs forever, at the cost of possibly forgetting
+about an IP you still cared about. Neither option is "correct" in general —
+you pick based on whether "always see new sources" or "never lose an old
+counter" matters more for what you're building.
 
-## What this demo's code actually does
+**Reading the packet.** A packet arriving on the wire is just a sequence of
+bytes. The first bytes describe Ethernet-level addressing (`struct
+ethhdr`), and — if this is an IP packet — the bytes right after that
+describe IP-level addressing (`struct iphdr`), which is where the source
+address (`saddr`) we care about lives. Before touching either struct, the
+code checks that the packet is actually long enough to contain it — once
+for the Ethernet header (`(void *)(eth + 1) > data_end`), and again,
+identically, for the IP header right after. This isn't defensive-programming
+politeness — it's mandatory: the verifier (section 2) cannot load a program
+that might read past the end of a buffer, and a packet can legitimately be
+shorter than a full header (truncated, malformed, or just not IP traffic).
+Skip the check and the kernel refuses to load the program at all, before a
+single packet is ever processed.
 
-`bpf/xdpcount.c` is an XDP program: it runs on every incoming packet, as
-early as the NIC driver's rx path. It parses just enough of the Ethernet + IP
-headers to pull out `saddr`, bumps a counter in `pkt_count`, and returns
-`XDP_PASS` to let the packet continue up the stack unmodified — this program
-observes, it never drops or redirects.
+**Counting.** Look up the source IP in the map; if it's there, add one to
+its counter; if not, insert it with a count of 1. The program then returns
+`XDP_PASS`, meaning "let this packet continue on its normal way" — this
+demo only observes traffic, it never drops or redirects it (XDP hooks can
+also return codes that drop or redirect a packet, but that's a different
+demo).
 
-XDP's pre-`sk_buff` performance pitch only holds in **native (driver) mode**,
-where the NIC driver itself calls into the XDP hook before building an
-`sk_buff`. Not every driver implements that; `link.AttachXDP` in this repo
-doesn't force a mode, so on a driver without native XDP support the kernel
-silently falls back to **generic/SKB mode**, running the same program *after*
-`sk_buff` allocation — functionally correct, but with none of the performance
-benefit being claimed. Check the mode you actually got with
-`ip -d link show dev <iface>` (`xdp` vs `xdpgeneric` in the output) before
-trusting a benchmark.
+One thing to know before you benchmark this: the "before the kernel even
+builds its normal packet representation" performance story only holds in
+**native mode**, where the network card's own driver calls directly into
+the XDP hook. Not every driver supports that; if yours doesn't, the kernel
+silently falls back to **generic mode**, running the exact same program
+correctly, just later in the pipeline, after that normal representation has
+already been built — same result, none of the speed advantage. You can
+check which mode you actually got with `ip -d link show dev <iface>` (look
+for `xdp` vs `xdpgeneric` in the output).
 
-Two subtleties worth calling out because they're exactly the kind of thing
-that's obvious once you've been bitten by it and invisible otherwise (both
-are also flagged as comments in the code):
+`cmd/xdpcount/main.go` is the user-space half: it loads the compiled
+bytecode, calls `link.AttachXDP` to wire it to the hook on your chosen
+network interface, then loops — every couple of seconds (configurable with
+`-interval`), read every entry currently in `pkt_count` and print it, until
+you hit Ctrl-C.
 
-- `pkt_count` is a *LRU* hash map, not a plain hash map. A plain hash map
-  with a fixed `max_entries` starts rejecting `bpf_map_update_elem` calls
-  once full — silently dropping visibility into new source IPs — the moment
-  someone port-scans the box or you're behind NAT with high source churn.
-  LRU trades "always accept new keys" for "may silently evict a key you
-  still cared about." Pick your poison at map-definition time, deliberately.
-- The Go side reinterprets the raw 4 bytes of `ip->saddr` (already
-  network-byte-order) as a `uint32` and writes it back out with
-  `binary.LittleEndian`. That round-trip only reproduces the original bytes
-  on a little-endian host (x86_64, aarch64 — i.e. every realistic target
-  today). It is *not* portable to a big-endian host, and it's the kind of
-  bug that won't show up until someone runs this on s390x.
+One subtlety here, also flagged as a comment in the code: **byte order** is
+the order a multi-byte number's bytes are arranged in memory — "most
+significant byte first" is called **big-endian**, "least significant byte
+first" is called **little-endian**. An IP address on the wire is always
+stored in what's called **network byte order**, which is big-endian,
+regardless of what CPU sent or receives it. The Go code takes those same 4
+raw bytes and reinterprets them as a plain number, then writes that number
+back out using `binary.LittleEndian` to print it as an address again. That
+round-trip only reproduces the original bytes correctly on a little-endian
+machine — the byte order essentially every modern CPU (x86_64, ARM64)
+actually uses — so the printed addresses would come out wrong on the
+handful of big-endian architectures still in use (like IBM's s390x, which
+is also why a separate `_bpfeb` ("BPF, big-endian") build of the compiled
+program exists, mentioned in the Quickstart above). A detail that's
+invisible until someone runs this somewhere unusual.
 
-## eBPF vs. the alternatives
+## 5. eBPF next to the tools you might already reach for
 
-| Approach | Runs where | Safety model | What it's actually good at | Where it loses |
-|---|---|---|---|---|
-| **eBPF (this repo)** | In-kernel, JITed | Static verification at load time, no kernel source/rebuild | Line-rate packet/syscall visibility & light mutation, one binary across kernel versions (CO-RE) | Verifier rejects genuinely complex control flow; no general-purpose heap (constrained allocators like `bpf_obj_new` exist since ~6.1 for opted-in program types); Linux-only |
-| **iptables/nftables** | In-kernel (netfilter) | Kernel-maintained, well-audited, decades of hardening | L3/L4 filtering with a stable, scriptable CLI everyone already knows | Legacy iptables walks rules linearly (`O(n)`); kube-proxy's IPVS mode already fixes that with `O(1)` hash-based lookups without any eBPF. Cilium's real edge over IPVS isn't the lookup complexity — it's connect-time load balancing (skipping NAT/DNAT entirely via a cgroup hook) and programmable policy that a rule/rule-set model can't express |
-| **Kernel module (LKM)** | In-kernel, native | None — a bug is a kernel panic or a rootkit-grade backdoor, at the module's discretion | Anything eBPF's verifier would reject: real data structures, full instruction set, arbitrary syscalls | Every kernel version/config combination is a new build target; a crash takes the whole box down; no built-in observability into what it's doing |
-| **DTrace / SystemTap / ptrace** | In-kernel (compiled probe) or via syscall interception | SystemTap compiles to a kernel module (same panic risk); ptrace is userspace-safe but stops the tracee on every event | Ad hoc, exploratory tracing; ptrace-based tools (strace) need zero kernel-side setup | SystemTap: same fragility as any LKM. ptrace: `PTRACE_SYSCALL`'s stop-on-every-call model makes it too slow for always-on production tracing — this is precisely the gap Falco's eBPF probe fills |
-| **DPDK (kernel bypass)** | Entirely in userspace, polling the NIC | No kernel involvement at all — you own the bugs | Higher raw throughput than XDP for a dedicated packet-processing box (no kernel handoff at all) | Takes exclusive ownership of the NIC — the machine can't also use that interface for ordinary networking; needs huge-page-backed poll-mode drivers; XDP gets you 80% of the win while the box still functions as a normal host |
-| **Sidecar proxy (Envoy/service mesh)** | Userspace, one hop per pod | Regular process — normal crash/restart semantics, easy to reason about | L7-aware routing, retries, mTLS — protocol semantics eBPF's verifier has no business trying to parse | Extra hop = extra latency per request, an extra container per pod, and a second config plane; this is exactly why Cilium's own service mesh mode pushes L4 into eBPF and keeps a sidecar (or sidecar-less proxy) only for the L7 slice that actually needs it |
+Now that the vocabulary from section 2 exists, here's how eBPF actually
+compares to the other ways of doing similar things — not as a scored table,
+but as "what's this other tool, and where does it actually win or lose."
 
-## Why it's eaten so much infrastructure since ~2018
+**iptables / nftables.** These are Linux's built-in packet-filtering tools:
+you write *rules* ("if the destination is this address, do that"), and the
+kernel walks that rule list for every packet. That list-walking is the
+catch: with a handful of rules it's instant, but Kubernetes clusters can
+easily generate thousands of rules (one set per Service), and a plain list
+walk gets slower as the list grows. `kube-proxy` has a second mode called
+**IPVS** (IP Virtual Server, a different built-in Linux load-balancing
+mechanism) that already fixes the raw lookup-speed problem with a hash
+table instead of a list — no eBPF needed for that part. Cilium's
+eBPF-based replacement wins somewhere else: it can decide where a
+connection should go *before* a packet is even built, so there's no
+address-translation step to reverse later, and it supports programmable
+policy logic instead of a fixed rule grammar — both things a rule list,
+however fast, structurally can't do.
 
-- **Cilium** replaces kube-proxy's datapath with eBPF hash maps for
-  Kubernetes Service resolution — O(1) lookup regardless of Service count,
-  plus features a rule-based dataplane structurally cannot do, like
-  intercepting a socket's `connect()` via the `BPF_CGROUP_INET4_CONNECT`
-  cgroup sock-addr hook, so load-balancing happens *before* a packet is even
-  built (no NAT hop at all for pod-to-Service traffic). Cilium separately
-  uses `BPF_PROG_TYPE_SOCK_OPS` + sockmap for a local pod-to-pod fast path,
-  and supports DSR (direct server return) so response traffic skips the
-  load balancer on the way back.
-- **Falco** moved from a custom kernel module to an eBPF probe for the same
-  reason SystemTap never fit always-on production use: a `sinsp`-style
-  syscall tracer needs to run permanently, on every node, and a verifier-
-  checked probe that can't panic the box is the difference between "runtime
-  security tool" and "the thing ops distrusts and disables."
-- **Katran** (Meta) is a Layer 4 load balancer that runs entirely as an XDP
-  program — packet-in to forwarding-decision without the kernel ever
-  allocating an `sk_buff` or walking the normal netfilter/routing stack,
-  which is why it handles millions of connections per box at a CPU cost
-  regular kernel-stack forwarding can't match.
-- **Continuous profilers** (Parca, and the profiling half of Grafana's
-  stack) use `perf_event_open`-triggered eBPF programs to walk stacks and
-  uprobes/USDT to hook language runtimes, giving fleet-wide always-on
-  profiling without recompiling or restarting a single target process —
-  the alternative (sampling profilers attached per-process, or
-  instrumenting each service's code) doesn't scale past a handful of
-  polyglot services. Pixie leans on the same eBPF/uprobe toolbox but its
-  core value is protocol-level tracing (auto-capturing HTTP/gRPC/SQL
-  traffic), with profiling as one feature alongside that, not the headline.
+**A kernel module.** Covered in section 1 — full access to the kernel, and
+full responsibility for not crashing it. eBPF exists specifically to get
+most of what a kernel module gives you (code running in the kernel) without
+that risk, at the cost of the verifier's restrictions (no recursion, no
+unbounded loops, limited stack). If what you're building genuinely needs
+those things — real recursive data structures, arbitrary instruction
+sequences — a kernel module is still sometimes the only option; you're just
+accepting "one bug away from a kernel panic" as the price.
 
-The pattern across all four: something used to require either a fragile
-kernel module, a slow syscall-interception shim, or an extra network hop —
-and eBPF collapsed it into a verifier-checked program that lives where the
-work already happens.
+**`ptrace`/`strace`, and tools like SystemTap.** `strace` uses `ptrace` to
+pause a process on every syscall, inspect it, and resume it — safe (it
+never touches the kernel itself) but too slow to run permanently on every
+process on every server, which is exactly the gap eBPF-based tracing fills.
+SystemTap takes the opposite trade-off: it compiles your tracing script
+into an actual kernel module at run time, so it's fast but carries the same
+crash risk as any hand-written module — there's no verifier checking a
+SystemTap script before it runs.
 
-## Where this is headed
+**DPDK.** A completely different strategy: skip the kernel's networking
+code entirely and let a user-space program talk to the network card
+directly. This gets you the highest possible raw packet throughput, because
+there's no kernel involved at all on the hot path — but it also means that
+network interface is no longer usable for normal networking on that
+machine at the same time, and it needs dedicated CPU cores spinning in a
+tight polling loop rather than being woken up by an interrupt. XDP (this
+demo's hook) gets close to DPDK's speed for a lot of workloads while the
+machine keeps working normally otherwise — that's the trade Cilium and
+Katran (below) make.
 
-- **`sched_ext`** (merged in Linux 6.12) lets you implement and hot-swap CPU
-  schedulers as BPF programs — no kernel rebuild, no reboot to try a
-  different scheduling policy. This is the same "verifier instead of trust"
-  bet extended to a subsystem people used to consider untouchable outside
-  kernel development.
-- **eBPF for Windows** (Microsoft) is *not* a port of the Linux BPF
-  subsystem into the NT kernel. It runs the IOVisor **uBPF** userspace VM
-  plus the **PREVAIL** verifier inside a Windows driver, exposing
-  Linux-compatible eBPF toolchains/APIs (including libbpf/cilium-ebpf-style
-  loaders) on top of a completely different execution engine underneath.
-  Worth knowing before assuming "eBPF" means the same guarantees on both
-  platforms.
-- The live debate worth tracking is eBPF vs. **WASM** as the general
-  "safely run someone else's code inside my process/kernel/proxy" model —
-  Envoy already supports WASM filters, and the pitch for WASM is a
-  general-purpose language target and a mature toolchain ecosystem, against
-  eBPF's kernel-level hook points and verifier maturity. Expect both to keep
-  their niches (eBPF close to the kernel/network fast path, WASM in
-  proxies/plugins/app-level sandboxes) rather than one replacing the other.
+**A sidecar proxy** (the Envoy-style pattern behind most service meshes):
+instead of touching the kernel at all, you run a small proxy process next
+to each of your application's instances and route traffic through it. This
+is the right tool when what you actually need is *application-layer*
+awareness — reading an HTTP path, retrying a failed gRPC call, negotiating
+TLS — because that kind of parsing is exactly what the verifier's
+"prove it terminates and stays in bounds" rule makes painful to do safely
+inside the kernel. The cost is an extra network hop and an extra running
+process per instance. This is why even Cilium's own service-mesh mode
+keeps a proxy around for that application-layer slice of the work, while
+pushing everything below it (routing, load-balancing) into eBPF.
 
-## When *not* to reach for eBPF
+## 6. Why this has taken over so much infrastructure since ~2018
 
-- **You need L7 protocol logic.** The verifier's whole design is "prove this
-  terminates and touches only what it's allowed to" — that is fundamentally
-  in tension with parsing HTTP/2 or gRPC framing. Even Cilium's L7-aware
-  features lean on a userspace proxy for the actually-variable-length,
-  stateful parsing; eBPF handles the L3/L4 fast path around it.
-- **Your logic doesn't fit the verifier's shape.** No recursion, a 512-byte
-  stack, only-recently-allowed bounded loops, and a hard 4096-instruction
-  ceiling the moment you're not running as a privileged loader. If the
-  logic needs real recursion or dynamic-sized data structures, you're
-  fighting the tool.
-- **You're targeting old kernels or non-Linux.** Practical CO-RE support
-  wants a BTF-enabled kernel; distros vary on how far back they backported
-  `CONFIG_DEBUG_INFO_BTF`, but treat "5.8+, ideally newer" as the realistic
-  floor for a CO-RE-based tool that doesn't want a kernel-version matrix.
-  There's no in-kernel eBPF on macOS/Windows-native (see above re: eBPF for
-  Windows running a different engine entirely).
-- **You're treating unprivileged eBPF as a hardened sandbox for untrusted
-  code.** It was pitched that way for years; the track record disagrees.
-  CVE-2021-3490 (ALU32 bounds-tracking bug in bitwise ops — any local,
-  unprivileged user who could load a BPF program could turn it into
-  out-of-bounds kernel reads/writes and escalate to arbitrary code
-  execution) is one of
-  several verifier-bypass CVEs that led Ubuntu, and eventually the upstream
-  kernel itself (`CONFIG_BPF_UNPRIV_DEFAULT_OFF`), to disable unprivileged
-  BPF loading by default. If your threat model includes "untrusted user on
-  the box," don't rely on eBPF's verifier as the sandbox boundary — that's
-  also why this demo's XDP program requires root/`CAP_BPF`+`CAP_NET_ADMIN`
-  rather than pretending unprivileged loading is a safe default.
+Four real, shipping examples, each solving the "used to need a kernel
+module or a slow workaround" problem from above:
+
+- **Cilium**, a Kubernetes networking plugin, replaces the iptables/IPVS
+  datapath with eBPF: Service traffic is resolved through a hash-table
+  lookup, and a hook on the socket's `connect()` call lets it pick the
+  final destination *before* a packet is even built, skipping the whole
+  address-translation dance entirely for pod-to-Service traffic.
+- **Falco**, a runtime security tool, watches every syscall on every node
+  to detect suspicious behavior (a shell spawned inside a container,
+  unexpected file access, ...). It moved from a custom kernel module to an
+  eBPF probe for the same reason `strace`-style tracing doesn't scale to
+  "always on, every node": a verifier-checked probe that structurally can't
+  panic the machine is the difference between a tool ops teams trust
+  running everywhere, and one they disable.
+- **Katran** (built by Meta) is a layer-4 load balancer built entirely as
+  an XDP program: it makes the "which backend should this connection go
+  to" decision at the earliest possible point in the network stack (section
+  3), which is how it forwards millions of connections per box at a CPU
+  cost a normal kernel-stack-based load balancer can't match.
+- **Continuous profilers** (Parca, and similar tooling from Grafana) attach
+  eBPF programs to a periodic timer to sample what every process on a
+  machine is doing, fleet-wide, without restarting or recompiling a single
+  one of those processes. The alternative — attaching a profiler to each
+  process individually — doesn't scale once you have many services written
+  in different languages.
+
+## 7. Where this is headed
+
+- **`sched_ext`** (merged into the mainline kernel in version 6.12) extends
+  the same idea to the **scheduler** — the part of the kernel that decides
+  which process gets to run on the CPU next. You can now write and hot-swap
+  a custom scheduling policy as a verified eBPF program, no kernel rebuild
+  or reboot required, for a subsystem that used to be effectively
+  off-limits outside kernel development.
+- **eBPF for Windows** (a Microsoft project) is *not* Linux's eBPF ported
+  into the Windows kernel — it's a different execution engine (a userspace
+  VM called uBPF, plus a separate verifier called PREVAIL) running inside a
+  Windows driver, exposing the same style of tools and APIs on top. Worth
+  knowing so you don't assume "eBPF" carries identical guarantees on both
+  operating systems.
+- The interesting long-term comparison to watch is eBPF against **WebAssembly
+  (WASM)** as a general "safely run someone else's code" model — WASM is
+  already used for browser and proxy plugins (Envoy supports WASM filters)
+  and has a more general-purpose toolchain, while eBPF's advantage is being
+  wired directly into kernel-level hook points with a decade of verifier
+  hardening behind it. The likely outcome is both keeping their own lane
+  (eBPF close to the kernel/network fast path, WASM in proxies and
+  application-level plugins) rather than one replacing the other.
+
+## 8. When *not* to reach for eBPF
+
+- **You need application-layer logic** (parsing HTTP, gRPC, retry policies,
+  ...). The verifier's entire design is "prove this terminates and touches
+  only what it's allowed to," which is fundamentally at odds with parsing
+  variable-length, stateful protocols. Even Cilium leans on a normal
+  userspace proxy for that slice of the work (section 5).
+- **Your logic doesn't fit inside what the verifier can prove safe.** No
+  recursion, a 512-byte stack limit, and loops must be provably bounded.
+  If what you're building genuinely needs recursion or open-ended data
+  structures, you're fighting the tool, not using it.
+- **You're targeting very old kernels, or a non-Linux system.** CO-RE
+  (section 2) needs a kernel built with BTF support; in practice, treat
+  "kernel 5.8 or newer" as the realistic floor if you don't want to
+  hand-maintain a build per kernel version. There's no true in-kernel eBPF
+  on Windows or macOS (see the eBPF for Windows note above).
+- **You're relying on eBPF as a hard security boundary for untrusted
+  users.** It was pitched for years as safe enough that any user could load
+  their own eBPF programs — the security track record has walked that back.
+  A real example: in 2021, a bug in how the verifier tracked value ranges
+  through bitwise operations (CVE-2021-3490) let an unprivileged local user
+  turn a crafted eBPF program into out-of-bounds kernel memory access, and
+  from there full control of the machine. That and similar bugs are why
+  most distributions now disable unprivileged eBPF loading by default —
+  loading a program requires elevated privileges (the same `CAP_BPF` this
+  demo needs), not "any logged-in user." If your threat model includes
+  untrusted users on the box, the verifier is not the sandbox boundary to
+  rely on.
 
 ## Sources
 
