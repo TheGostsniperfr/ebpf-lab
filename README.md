@@ -120,6 +120,19 @@ cheapest possible place to make a decision about a packet (count it, drop
 it, redirect it) because none of the normal networking machinery has run
 yet.
 
+Concretely, "normal networking machinery" means the pipeline below — this
+is the same routing/firewall/connection-tracking machinery just mentioned,
+laid out as a diagram. XDP (bottom left, `XDP eBPF`) runs before any of it:
+
+![Packet flow through Netfilter, from XDP at the very left to either a local application at the top or another network interface at the right](docs/images/netfilter-packet-flow.png)
+
+*Diagram by Jan Engelhardt, [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/deed.en),
+via [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Netfilter-packet-flow.svg)
+(XDP additions by Matteo Croce). Unmodified except resized.*
+
+Full breakdown of what each part of that diagram does, in plain terms, with
+examples: [docs/netfilter-packet-flow.md](docs/netfilter-packet-flow.md).
+
 ```
 kernel                                       user space
 ┌───────────────────────────────┐            ┌──────────────────────┐
