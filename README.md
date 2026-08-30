@@ -203,8 +203,8 @@ struct {
 
 Read this as: "a map named `pkt_count`, where each key is a 4-byte source
 IP address and each value is an 8-byte counter, holding at most 4096
-entries." `BPF_MAP_TYPE_LRU_HASH` (LRU = Least Recently Used) is the map
-*kind*: a plain hash map with a fixed size starts silently **rejecting**
+entries." [`BPF_MAP_TYPE_LRU_HASH`](https://docs.ebpf.io/linux/map-type/BPF_MAP_TYPE_LRU_HASH/) (LRU = Least Recently Used) is the map
+*kind*: a [plain hash map](https://docs.ebpf.io/linux/map-type/BPF_MAP_TYPE_HASH/) with a fixed size starts silently **rejecting**
 new keys once full, which means you'd stop seeing new source IPs the
 moment the map fills up. This LRU variant instead **evicts** whichever
 existing key has gone the longest without being touched, to make room —
@@ -214,10 +214,11 @@ trade-off you pick deliberately when you define the map.
 
 ### 4.2 Reading the packet, byte by byte, with proof it's safe
 
-A packet arriving on the wire is just a sequence of bytes. XDP hands your
-program a `[data, data_end)` range and nothing more — no parsed "packet"
-object — so the program has to read those bytes itself, in the same order
-they'd actually appear: Ethernet addressing first, then IP addressing:
+A packet arriving on the wire is just a sequence of bytes. [XDP](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_XDP/)
+hands your program a `[data, data_end)` range and nothing more — no parsed
+"packet" object — so the program has to read those bytes itself, in the
+same order they'd actually appear: Ethernet addressing first, then IP
+addressing:
 
 ```c
 SEC("xdp")
@@ -280,11 +281,14 @@ cheaper than converting the packet's bytes.
 }
 ```
 
-`bpf_map_lookup_elem` is a map read: "does `pkt_count` already have an
-entry for this source IP?" If yes, `__sync_fetch_and_add` increments it in
-place — atomically, because packets on different CPU cores can hit this
-same line at the same time. If no, `bpf_map_update_elem` inserts a fresh
-entry starting at 1. Either way, the function ends with `XDP_PASS`: this
+[`bpf_map_lookup_elem`](https://docs.ebpf.io/linux/helper-function/bpf_map_lookup_elem/)
+is a map read: "does `pkt_count` already have an entry for this source
+IP?" If yes, `__sync_fetch_and_add` increments it in place — atomically,
+because [packets on different CPU cores can run this program
+concurrently](https://docs.ebpf.io/linux/concepts/concurrency/) and hit
+this same line at the same time. If no,
+[`bpf_map_update_elem`](https://docs.ebpf.io/linux/helper-function/bpf_map_update_elem/)
+inserts a fresh entry starting at 1. Either way, the function ends with `XDP_PASS`: this
 program only ever observes traffic, it never drops or redirects it (XDP
 supports return codes that do — `XDP_DROP`, `XDP_TX`, `XDP_REDIRECT` — but
 using them is a different demo).
@@ -509,6 +513,7 @@ actually stick.
 
 ## Sources
 
+- [eBPF Docs — helper functions, map types, program types reference](https://docs.ebpf.io/)
 - [BPF Design Q&A — kernel docs](https://docs.kernel.org/bpf/bpf_design_QA.html)
 - [Complexity of the BPF Verifier — pchaigno](https://pchaigno.github.io/ebpf/2019/07/02/bpf-verifier-complexity.html)
 - [Kubernetes Without kube-proxy — Cilium docs](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/)

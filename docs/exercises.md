@@ -42,15 +42,18 @@ forget" in this scenario?
 <details>
 <summary>Solution</summary>
 
-Plain `BPF_MAP_TYPE_HASH`, sized comfortably above the "few dozen ports"
-you expect (e.g. `max_entries = 256`). Since the key space is small and
-bounded, you'll realistically never hit "full," so the plain hash map's
-downside (silently rejecting new keys once full) never actually triggers
-— and you get its upside instead: it never *evicts* a counter you already
-had, which the scenario says matters more here than gracefully absorbing
-unexpected new keys. `LRU_HASH` is the right call in the *opposite*
-scenario (this repo's actual one): an open-ended key space like arbitrary
-source IPs, where you can't bound how many distinct keys you'll ever see.
+Plain [`BPF_MAP_TYPE_HASH`](https://docs.ebpf.io/linux/map-type/BPF_MAP_TYPE_HASH/),
+sized comfortably above the "few dozen ports" you expect (e.g.
+`max_entries = 256`). Since the key space is small and bounded, you'll
+realistically never hit "full," so the plain hash map's downside
+(silently rejecting new keys once full) never actually triggers — and you
+get its upside instead: it never *evicts* a counter you already had,
+which the scenario says matters more here than gracefully absorbing
+unexpected new keys.
+[`BPF_MAP_TYPE_LRU_HASH`](https://docs.ebpf.io/linux/map-type/BPF_MAP_TYPE_LRU_HASH/)
+is the right call in the *opposite* scenario (this repo's actual one): an
+open-ended key space like arbitrary source IPs, where you can't bound how
+many distinct keys you'll ever see.
 
 </details>
 
