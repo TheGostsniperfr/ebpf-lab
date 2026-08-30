@@ -61,12 +61,13 @@ int xdp_count_pkts(struct xdp_md *ctx) {
 	if ((void *)(ip + 1) > data_end)
 		return XDP_PASS;
 
-	__u32 src_ip = ip->saddr;
+	// __u32 src_ip = ip->saddr;
+	__u32 dest_ip = ip->daddr; // exo 2
 
 	// The map lookup/update pair below is the only way this program talks
 	// to the outside world: bump the existing counter for this source IP,
 	// or create it at 1 if this is the first packet we've seen from it.
-	__u64 *count = bpf_map_lookup_elem(&pkt_count, &src_ip);
+	__u64 *count = bpf_map_lookup_elem(&pkt_count, &dest_ip);
 	if (count) {
 		__sync_fetch_and_add(count, 1);
 	} else {
@@ -75,7 +76,7 @@ int xdp_count_pkts(struct xdp_md *ctx) {
 		// another CPU (both take this branch, one update wins). Fine for a
 		// demo; a production counter would retry the lookup after a failed
 		// BPF_NOEXIST update.
-		bpf_map_update_elem(&pkt_count, &src_ip, &init, BPF_ANY);
+		bpf_map_update_elem(&pkt_count, &dest_ip, &init, BPF_ANY);
 	}
 
 	// XDP_PASS: let the packet continue up the normal networking stack

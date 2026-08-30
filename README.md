@@ -181,10 +181,8 @@ real eBPF-based Go project (Cilium, Tetragon, Hubble) makes.
 ## 4. Reading the actual code
 
 This section walks through the real files in this repo, in the order
-they'd actually execute, with the code itself inline so you don't have to
-keep two windows open. The source files carry the same explanations as
-inline comments too — if you'd rather read them in an editor with syntax
-highlighting, that works just as well.
+they'd actually execute, with the code inline. The source files carry the
+same explanations as inline comments.
 
 ### 4.1 The map: where the kernel side and the Go side meet
 

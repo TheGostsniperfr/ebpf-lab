@@ -1,0 +1,40 @@
+{
+	"version": "0.2",
+	"language": "en",
+	"words": [
+		"bpfeb",
+		"bpfel",
+		"btf",
+		"cilium",
+		"clangd",
+		"devshell",
+		"ebpf",
+		"ethhdr",
+		"gopls",
+		"gostsniperfr",
+		"htons",
+		"iface",
+		"iphdr",
+		"ipv4",
+		"libbpf",
+		"memlock",
+		"netfilter",
+		"nixpkgs",
+		"objs",
+		"pkt",
+		"pkts",
+		"rlimit",
+		"saddr",
+		"uapi",
+		"Xdp",
+		"xdpcount"
+	],
+	"ignorePaths": [
+		"cmd/xdpcount/xdpcount_bpfel.go",
+		"cmd/xdpcount/xdpcount_bpfeb.go",
+		"**/*.o",
+		"go.sum",
+		"flake.lock",
+		".nix-support/**"
+	]
+}
