@@ -180,73 +180,183 @@ real eBPF-based Go project (Cilium, Tetragon, Hubble) makes.
 
 ## 4. Reading the actual code
 
-`bpf/xdpcount.c` is the part that runs inside the kernel. Three pieces:
+This section walks through the real files in this repo, in the order
+they'd actually execute, with the code itself inline so you don't have to
+keep two windows open. The source files carry the same explanations as
+inline comments too — if you'd rather read them in an editor with syntax
+highlighting, that works just as well.
 
-**The map.** `pkt_count` is declared as a `BPF_MAP_TYPE_LRU_HASH`: a
-key→value store (key = a source IP, value = a packet count) with a fixed
-maximum size, where "LRU" (Least Recently Used) means that once it's full,
-inserting a new key automatically evicts whichever existing key hasn't been
-touched in the longest time — instead of just refusing the insert. That's a
-deliberate trade-off, not a default you can ignore: a plain hash map (no
-LRU) would start silently rejecting new source IPs once full, which means
-you'd stop seeing new attackers/hosts the moment the map fills up. The LRU
-version keeps accepting new IPs forever, at the cost of possibly forgetting
-about an IP you still cared about. Neither option is "correct" in general —
-you pick based on whether "always see new sources" or "never lose an old
-counter" matters more for what you're building.
+### 4.1 The map: where the kernel side and the Go side meet
 
-**Reading the packet.** A packet arriving on the wire is just a sequence of
-bytes. The first bytes describe Ethernet-level addressing (`struct
-ethhdr`), and — if this is an IP packet — the bytes right after that
-describe IP-level addressing (`struct iphdr`), which is where the source
-address (`saddr`) we care about lives. Before touching either struct, the
-code checks that the packet is actually long enough to contain it — once
-for the Ethernet header (`(void *)(eth + 1) > data_end`), and again,
-identically, for the IP header right after. This isn't defensive-programming
-politeness — it's mandatory: the verifier (section 2) cannot load a program
-that might read past the end of a buffer, and a packet can legitimately be
-shorter than a full header (truncated, malformed, or just not IP traffic).
-Skip the check and the kernel refuses to load the program at all, before a
-single packet is ever processed.
+`bpf/xdpcount.c` declares one BPF map — the shared key→value store from
+section 2 — before it declares any actual logic:
 
-**Counting.** Look up the source IP in the map; if it's there, add one to
-its counter; if not, insert it with a count of 1. The program then returns
-`XDP_PASS`, meaning "let this packet continue on its normal way" — this
-demo only observes traffic, it never drops or redirects it (XDP hooks can
-also return codes that drop or redirect a packet, but that's a different
-demo).
+```c
+// LRU so a scan from an unrelated host can't grow this map without bound.
+// Trade-off: once full, a new source IP evicts the least-recently-used
+// entry, which can silently drop a counter you still cared about.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);   // ip->saddr, raw network-byte-order bytes
+	__type(value, __u64); // packet count
+} pkt_count SEC(".maps");
+```
 
-One thing to know before you benchmark this: the "before the kernel even
-builds its normal packet representation" performance story only holds in
-**native mode**, where the network card's own driver calls directly into
-the XDP hook. Not every driver supports that; if yours doesn't, the kernel
-silently falls back to **generic mode**, running the exact same program
-correctly, just later in the pipeline, after that normal representation has
-already been built — same result, none of the speed advantage. You can
-check which mode you actually got with `ip -d link show dev <iface>` (look
-for `xdp` vs `xdpgeneric` in the output).
+Read this as: "a map named `pkt_count`, where each key is a 4-byte source
+IP address and each value is an 8-byte counter, holding at most 4096
+entries." `BPF_MAP_TYPE_LRU_HASH` (LRU = Least Recently Used) is the map
+*kind*: a plain hash map with a fixed size starts silently **rejecting**
+new keys once full, which means you'd stop seeing new source IPs the
+moment the map fills up. This LRU variant instead **evicts** whichever
+existing key has gone the longest without being touched, to make room —
+keeping accepting new IPs forever, at the cost of possibly forgetting an
+IP you still cared about. Neither behavior is "correct" in general; it's a
+trade-off you pick deliberately when you define the map.
 
-`cmd/xdpcount/main.go` is the user-space half: it loads the compiled
-bytecode, calls `link.AttachXDP` to wire it to the hook on your chosen
-network interface, then loops — every couple of seconds (configurable with
-`-interval`), read every entry currently in `pkt_count` and print it, until
-you hit Ctrl-C.
+### 4.2 Reading the packet, byte by byte, with proof it's safe
 
-One subtlety here, also flagged as a comment in the code: **byte order** is
-the order a multi-byte number's bytes are arranged in memory — "most
-significant byte first" is called **big-endian**, "least significant byte
-first" is called **little-endian**. An IP address on the wire is always
-stored in what's called **network byte order**, which is big-endian,
-regardless of what CPU sent or receives it. The Go code takes those same 4
-raw bytes and reinterprets them as a plain number, then writes that number
-back out using `binary.LittleEndian` to print it as an address again. That
-round-trip only reproduces the original bytes correctly on a little-endian
-machine — the byte order essentially every modern CPU (x86_64, ARM64)
-actually uses — so the printed addresses would come out wrong on the
-handful of big-endian architectures still in use (like IBM's s390x, which
-is also why a separate `_bpfeb` ("BPF, big-endian") build of the compiled
-program exists, mentioned in the Quickstart above). A detail that's
-invisible until someone runs this somewhere unusual.
+A packet arriving on the wire is just a sequence of bytes. XDP hands your
+program a `[data, data_end)` range and nothing more — no parsed "packet"
+object — so the program has to read those bytes itself, in the same order
+they'd actually appear: Ethernet addressing first, then IP addressing:
+
+```c
+SEC("xdp")
+int xdp_count_pkts(struct xdp_md *ctx) {
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_PASS;
+
+	if (eth->h_proto != bpf_htons(ETH_P_IP))
+		return XDP_PASS;
+
+	struct iphdr *ip = (void *)(eth + 1);
+	if ((void *)(ip + 1) > data_end)
+		return XDP_PASS;
+
+	__u32 src_ip = ip->saddr;
+```
+
+Line by line: `struct ethhdr *eth = data` treats the very first bytes of
+the packet as an Ethernet header (source/destination hardware address,
+plus a field saying what comes next). `struct iphdr *ip = (void *)(eth +
+1)` then treats the bytes *right after* that header as an IP header —
+`eth + 1` means "one whole `ethhdr` past `eth`," i.e. the first byte once
+Ethernet addressing is done. `ip->saddr` is the field inside that IP
+header holding the sender's address — the one thing this whole program
+actually wants.
+
+The two `if ((void *)(... + 1) > data_end) return XDP_PASS;` lines are not
+optional style. A packet can legitimately be shorter than a full header
+(truncated, malformed, or simply not an IP packet at all), and the
+verifier (section 2) will not load a program that might read past the end
+of a buffer — full stop. Skip either check, and the program is rejected at
+load time, before it has processed a single real packet. `XDP_PASS` here
+means "give up on this packet, let it continue up the stack unmodified" —
+the same meaning it has at the very end of the function, just reached
+early.
+
+The `eth->h_proto != bpf_htons(ETH_P_IP)` check filters out anything that
+isn't an IPv4 packet (ARP, IPv6, ...) before we try to read an IP header
+out of it. `bpf_htons()` converts our comparison constant into the same
+big-endian byte order the packet's own `h_proto` field is stored in (see
+"byte order," end of this section) — converting the constant once is
+cheaper than converting the packet's bytes.
+
+### 4.3 Counting, and handing the packet back
+
+```c
+	__u64 *count = bpf_map_lookup_elem(&pkt_count, &src_ip);
+	if (count) {
+		__sync_fetch_and_add(count, 1);
+	} else {
+		__u64 init = 1;
+		bpf_map_update_elem(&pkt_count, &src_ip, &init, BPF_ANY);
+	}
+
+	return XDP_PASS;
+}
+```
+
+`bpf_map_lookup_elem` is a map read: "does `pkt_count` already have an
+entry for this source IP?" If yes, `__sync_fetch_and_add` increments it in
+place — atomically, because packets on different CPU cores can hit this
+same line at the same time. If no, `bpf_map_update_elem` inserts a fresh
+entry starting at 1. Either way, the function ends with `XDP_PASS`: this
+program only ever observes traffic, it never drops or redirects it (XDP
+supports return codes that do — `XDP_DROP`, `XDP_TX`, `XDP_REDIRECT` — but
+using them is a different demo).
+
+One thing worth knowing before you benchmark this: the "before the kernel
+even builds its normal packet representation" performance story from
+section 3 only holds in **native mode**, where the network card's own
+driver calls directly into the XDP hook. Not every driver supports that;
+if yours doesn't, the kernel silently falls back to **generic mode**,
+running this exact same program correctly, just later in the pipeline,
+after that normal representation has already been built — same result,
+none of the speed advantage. Check which mode you actually got with
+`ip -d link show dev <iface>` (look for `xdp` vs `xdpgeneric` in the
+output).
+
+### 4.4 The Go side: load, attach, read
+
+`cmd/xdpcount/main.go` is the user-space half. The two lines that matter
+most are the load and the attach:
+
+```go
+objs := xdpcountObjects{}
+if err := loadXdpcountObjects(&objs, nil); err != nil {
+	log.Fatalf("loading BPF objects: %v", err)
+}
+defer objs.Close()
+
+l, err := link.AttachXDP(link.XDPOptions{
+	Program:   objs.XdpCountPkts,
+	Interface: iface.Index,
+})
+```
+
+`loadXdpcountObjects` comes from a *generated* file (`xdpcount_bpfel.go`,
+produced by `go generate`, mentioned in the Quickstart above) — this is
+the moment the compiled bytecode from section 4.1–4.3 is actually handed
+to the kernel and run through the verifier. If it survives, `objs` now
+holds live handles to the program (`XdpCountPkts`) and the map
+(`PktCount`) declared in the C file. `link.AttachXDP` is the attach step:
+from this call onward, every packet arriving on the chosen interface runs
+`xdp_count_pkts()` in the kernel.
+
+From there, the rest of `main.go` is a plain Go loop: every couple of
+seconds (configurable with `-interval`), read every entry currently in
+`pkt_count` and print it, until Ctrl-C:
+
+```go
+it := m.Iterate()
+for it.Next(&key, &count) {
+	binary.LittleEndian.PutUint32(addr, key)
+	log.Printf("%-15s %d packets", addr.String(), count)
+}
+```
+
+**Byte order**, the subtlety in that last line: it's the order a
+multi-byte number's bytes are arranged in — "most significant byte first"
+is called **big-endian**, "least significant byte first" is called
+**little-endian**. An IP address on the wire is always stored in what's
+called **network byte order**, which is big-endian, regardless of what CPU
+sent or receives it — this is what `ip->saddr` in section 4.2 actually
+contains. The Go code above takes those same 4 raw bytes (copied verbatim
+into the map's `uint32` key) and writes them back out with
+`binary.LittleEndian` to print them as an address again. That round-trip
+only reproduces the original bytes correctly on a little-endian machine —
+the byte order essentially every modern CPU (x86_64, ARM64) actually uses
+— so the printed addresses would come out wrong on the handful of
+big-endian architectures still in use (like IBM's s390x, which is also why
+a separate `_bpfeb`, "BPF big-endian," build of the compiled program
+exists, mentioned in the Quickstart above). A detail that's invisible
+until someone runs this somewhere unusual.
 
 ## 5. eBPF next to the tools you might already reach for
 
@@ -390,6 +500,14 @@ module or a slow workaround" problem from above:
   demo needs), not "any logged-in user." If your threat model includes
   untrusted users on the box, the verifier is not the sandbox boundary to
   rely on.
+
+## 9. Check your understanding
+
+[docs/exercises.md](docs/exercises.md) has five small exercises against
+this repo's actual code and the Netfilter doc from section 3 — each with a
+collapsible hint and a collapsible solution, so you can try before you
+peek. Not graded, just a way to catch it yourself if something didn't
+actually stick.
 
 ## Sources
 

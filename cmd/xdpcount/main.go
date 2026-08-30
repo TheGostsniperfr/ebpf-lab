@@ -4,6 +4,11 @@
 // Requires CAP_BPF + CAP_NET_ADMIN (or root). See the repo README for setup.
 package main
 
+// This line runs on every `go generate ./...`: it compiles bpf/xdpcount.c
+// to BPF bytecode via clang, then writes the xdpcount_bpfel.go/_bpfeb.go
+// files that define xdpcountObjects, loadXdpcountObjects, and friends,
+// used a few lines below. Those generated files aren't in this file — open
+// xdpcount_bpfel.go after running `go generate` to see what got produced.
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go xdpcount ../../bpf/xdpcount.c
 
 import (
@@ -30,6 +35,8 @@ func main() {
 		log.Fatal("must specify -iface (see `ip link` for interface names)")
 	}
 
+	// XDP attaches to an interface *index* (an integer), not its name — this
+	// lookup just translates the human-readable name you passed on the CLI.
 	iface, err := net.InterfaceByName(*ifaceName)
 	if err != nil {
 		log.Fatalf("lookup network iface %q: %v", *ifaceName, err)
@@ -41,12 +48,20 @@ func main() {
 		log.Fatalf("remove memlock rlimit: %v", err)
 	}
 
+	// loadXdpcountObjects (generated, see the go:generate line above) is
+	// where the compiled BPF bytecode actually gets handed to the kernel
+	// and run through the verifier. objs.XdpCountPkts and objs.PktCount
+	// below are now live handles to the program and the map defined in
+	// bpf/xdpcount.c.
 	objs := xdpcountObjects{}
 	if err := loadXdpcountObjects(&objs, nil); err != nil {
 		log.Fatalf("loading BPF objects: %v", err)
 	}
 	defer objs.Close()
 
+	// This is the actual attach step: from here on, every packet arriving
+	// on iface runs xdp_count_pkts() in the kernel before anything else
+	// touches it.
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpCountPkts,
 		Interface: iface.Index,
@@ -54,7 +69,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("attach XDP to %s: %v", *ifaceName, err)
 	}
-	defer l.Close()
+	defer l.Close() // detaches on exit — without this, the program stays attached
 
 	log.Printf("counting packets on %s, ctrl-c to stop", *ifaceName)
 
@@ -75,6 +90,9 @@ func main() {
 	}
 }
 
+// dumpStats reads every entry currently in the kernel-side map and prints
+// it. This is the *only* way this program learns anything about traffic —
+// it never sees a single packet itself, only these aggregated counts.
 func dumpStats(m *ebpf.Map) {
 	var (
 		key   uint32
