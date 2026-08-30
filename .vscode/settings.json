@@ -1,0 +1,7 @@
+{
+    "nixEnvSelector.nixFile": "${workspaceFolder}/flake.nix",
+    "nixEnvSelector.useFlakes": true,
+    "nixEnvSelector.flakeShell": "default",
+    "clangd.path": "${workspaceFolder}/.nix-support/clang/bin/clangd",
+    "C_Cpp.intelliSenseEngine": "disabled"
+}

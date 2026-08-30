@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "ebpf-lab",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/.nix-support/libbpf/include",
+                "${workspaceFolder}/.nix-support/linux-headers/include"
+            ],
+            "defines": [],
+            "compilerPath": "${workspaceFolder}/.nix-support/clang/bin/clang",
+            "cStandard": "gnu17",
+            "intelliSenseMode": "linux-clang-x64"
+        }
+    ],
+    "version": 4
+}

@@ -29,6 +29,16 @@
           BPF2GO_CC = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
           BPF2GO_STRIP = "${pkgs.llvm}/bin/llvm-strip";
           BPF2GO_CFLAGS = "-O2 -g -Wall -Werror -I${pkgs.libbpf}/include -I${pkgs.linuxHeaders}/include";
+
+          # Stable symlinks so editor tooling (VSCode cpptools, clangd) can
+          # point at fixed paths instead of hashed nix store paths that
+          # change on every rebuild.
+          shellHook = ''
+            mkdir -p .nix-support
+            ln -sfn ${pkgs.libbpf} .nix-support/libbpf
+            ln -sfn ${pkgs.linuxHeaders} .nix-support/linux-headers
+            ln -sfn ${pkgs.llvmPackages.clang-unwrapped} .nix-support/clang
+          '';
         };
       });
 }

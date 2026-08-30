@@ -1,0 +1,6 @@
+CompileFlags:
+  Compiler: .nix-support/clang/bin/clang
+  Add:
+    - -I../.nix-support/libbpf/include
+    - -I../.nix-support/linux-headers/include
+    - -Wall
